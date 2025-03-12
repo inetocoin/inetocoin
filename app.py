@@ -2,29 +2,40 @@ import hashlib
 import json
 import time
 import uvicorn
+import aerospike
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
+config = {
+    'hosts': [('127.0.0.1', 3000)]
+}
+client = aerospike.client(config).connect()
+
 class Blockchain:
     def __init__(self):
-        self.chain = []
+        self.namespace = 'blockchain'
+        self.set_name = 'blocks'
         self.transactions = []
         self.create_block(proof=1, previous_hash='0')
 
     def create_block(self, proof, previous_hash):
         block = {
-            'index': len(self.chain) + 1,
+            'index': self.get_chain_length() + 1,
             'timestamp': time.time(),
             'transactions': self.transactions,
             'proof': proof,
             'previous_hash': previous_hash
         }
         self.transactions = []
-        self.chain.append(block)
+        key = (self.namespace, self.set_name, block['index'])
+        client.put(key, block)
         return block
 
     def get_previous_block(self):
-        return self.chain[-1]
+        index = self.get_chain_length()
+        key = (self.namespace, self.set_name, index)
+        _, _, block = client.get(key)
+        return block
 
     def proof_of_work(self, previous_proof):
         new_proof = 1
@@ -43,33 +54,50 @@ class Blockchain:
 
     def add_transaction(self, sender, receiver, amount):
         self.transactions.append({'sender': sender, 'receiver': receiver, 'amount': amount})
-        return self.get_previous_block()['index'] + 1
+        return self.get_chain_length() + 1
+
+    def get_chain(self):
+        chain = []
+        for i in range(1, self.get_chain_length() + 1):
+            key = (self.namespace, self.set_name, i)
+            _, _, block = client.get(key)
+            chain.append(block)
+        return chain
+
+    def get_chain_length(self):
+        try:
+            return client.info_random('sets/blockchain/blocks')['objects']
+        except:
+            return 0
 
 class SmartContract:
     def __init__(self):
-        self.contracts = {}
+        self.namespace = 'blockchain'
+        self.set_name = 'contracts'
 
     def create_contract(self, contract_id, conditions):
-        if contract_id in self.contracts:
+        key = (self.namespace, self.set_name, contract_id)
+        try:
+            client.get(key)
             return "Contract already exists"
-        self.contracts[contract_id] = {
-            'conditions': conditions,
-            'executed': False
-        }
-        return "Contract created successfully"
+        except aerospike.exception.RecordNotFound:
+            client.put(key, {'conditions': conditions, 'executed': False})
+            return "Contract created successfully"
 
     def execute_contract(self, contract_id, context):
-        if contract_id not in self.contracts:
+        key = (self.namespace, self.set_name, contract_id)
+        try:
+            _, _, contract = client.get(key)
+            if contract['executed']:
+                return "Contract already executed"
+            if all(context.get(k) == v for k, v in contract['conditions'].items()):
+                contract['executed'] = True
+                client.put(key, contract)
+                return "Contract executed successfully"
+            else:
+                return "Contract conditions not met"
+        except aerospike.exception.RecordNotFound:
             return "Contract not found"
-        contract = self.contracts[contract_id]
-        if contract['executed']:
-            return "Contract already executed"
-
-        if all(context.get(k) == v for k, v in contract['conditions'].items()):
-            contract['executed'] = True
-            return "Contract executed successfully"
-        else:
-            return "Contract conditions not met"
 
 app = FastAPI()
 blockchain = Blockchain()
@@ -104,7 +132,7 @@ def add_transaction(transaction: Transaction):
 
 @app.get('/v1/get_chain')
 def get_chain():
-    return {'chain': blockchain.chain, 'length': len(blockchain.chain)}
+    return {'chain': blockchain.get_chain(), 'length': blockchain.get_chain_length()}
 
 @app.post('/v1/create_contract')
 def create_contract(contract: Contract):
