@@ -1,0 +1,2 @@
+# inetocoin
+Internet Coin
